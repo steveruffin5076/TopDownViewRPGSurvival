@@ -1,0 +1,598 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>DUSKWARD — light &amp; sound prototype</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #05070c; overflow: hidden;
+               font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; color: #cfd6e4; }
+  canvas { display: block; position: absolute; inset: 0; }
+
+  .panel { position: absolute; background: rgba(8,11,18,.82); border: 1px solid #232c3b;
+           border-radius: 8px; padding: 10px 12px; font-size: 12px; }
+  #hud   { top: 12px; left: 12px; width: 236px; }
+  #log   { bottom: 12px; left: 12px; width: 340px; line-height: 1.5; }
+  #help  { bottom: 12px; right: 12px; width: 310px; line-height: 1.7; color: #8e9bb3; }
+  #title { top: 12px; right: 12px; width: 310px; color: #8e9bb3; }
+
+  .row { display: flex; justify-content: space-between; align-items: center; margin: 3px 0; }
+  .k { color: #6f7d95; }
+  .v { color: #e8edf6; font-weight: 600; }
+  .bar { height: 8px; background: #1a2130; border-radius: 4px; overflow: hidden; margin-top: 2px; }
+  .bar > i { display: block; height: 100%; width: 0%; }
+  #msg { margin-top: 8px; color: #ffb4b4; min-height: 15px; font-weight: 600; }
+  .tier0 { color: #8e9bb3; } .tier1 { color: #7fd4ff; } .tier2 { color: #ffcf6a; } .tier3 { color: #ff6b6b; }
+  kbd { background:#1a2130; border:1px solid #2b3648; border-radius:4px; padding:0 4px; color:#cfd6e4; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="title" class="panel">
+  <div style="color:#ffd27a;font-weight:700;letter-spacing:.14em">DUSKWARD</div>
+  <div style="margin-top:4px">Light &amp; sound prototype · HTML5 / Canvas 2D<br>
+  Light keeps the dark out. Light tells them where you are.</div>
+</div>
+
+<div id="hud" class="panel">
+  <div class="row"><span class="k">LAMP</span><span class="v" id="lamp">DIM</span></div>
+  <div class="row"><span class="k">OIL</span><span class="v" id="oil">100%</span></div>
+  <div class="bar"><i id="oilbar" style="background:#ffd27a"></i></div>
+  <div class="row" style="margin-top:8px"><span class="k">EXPOSURE</span><span class="v" id="seen">0%</span></div>
+  <div class="bar"><i id="seenbar" style="background:#ff6b6b"></i></div>
+  <div class="row" style="margin-top:8px"><span class="k">THREAT</span><span class="v tier0" id="tier">CALM</span></div>
+  <div id="msg"></div>
+</div>
+
+<div id="log" class="panel"><span class="k">EVENTS</span><div id="events"></div></div>
+
+<div id="help" class="panel">
+  <kbd>WASD</kbd> move &nbsp; <kbd>Shift</kbd> sprint (noisy) &nbsp; <kbd>Ctrl</kbd> sneak<br>
+  <kbd>L</kbd> cycle lamp off → dim → bright &nbsp; <kbd>Tab</kbd> focus (reveal all cones)<br>
+  <kbd>R</kbd> restart<br>
+  <span style="color:#5f6c82">Reach the marked furnace district in the far corner.
+  Guards spot you in the light; the Hollow hunts you in the dark. Never be both at once.</span>
+</div>
+
+<script>
+"use strict";
+/* ============================================================
+   DUSKWARD prototype — proves the core loop in plain HTML/JS
+   - tile map + follow camera
+   - guard vision cones with real raycast occlusion
+   - awareness driven by LIGHT x SPEED x DISTANCE
+   - noise events (sprinting) with a hearing radius
+   - alarm escalation: PATROL -> SUSPICIOUS -> HUNT -> SEARCH
+   - a Hollow that hunts sound and cannot abide light
+   ============================================================ */
+
+/* ---- map: built from explicit segments so row widths can never drift.
+   Layout (56 x 30 tiles):
+     bands 1-3 : room A/J/M x1-14 | wall x15 | room B/E/H/K/N x16-38 | wall x39 | room C/F/I/L/O x40-54
+     bands 4-5 : room J/M x1-18   | wall x19 | room K/N x20-38        | wall x39 | room L/O x40-54
+     legend: # wall  . floor  + door  P player  X goal
+             G guard  1-8 patrol waypoints  L light source  H hollow  o oil ---- */
+const TILE = 32, COLS = 56, ROWS = 30;
+const dots = n => ".".repeat(n);
+const row = (...parts) => parts.join("");
+const wallRow = doors => { const a = new Array(COLS).fill("#"); doors.forEach(d => { a[d] = "+"; }); return a.join(""); };
+const band  = (a, b, c, midDoor) => row("#", a, midDoor ? "+" : "#", b, "#", c, "#");   // 1+14+1+23+1+15+1 = 56
+const band2 = (j, k, l, midDoor) => row("#", j, "#", k, midDoor ? "+" : "#", l, "#");   // 1+18+1+19+1+15+1 = 56
+const hall  = (...marks) => {                                                        // 1+54+1 = 56
+  const a = new Array(54).fill(".");
+  marks.forEach(([x, ch]) => { a[x - 1] = ch; });
+  return row("#", a.join(""), "#");
+};
+
+const MAP = [
+  wallRow([]),                                                                              // r0  border
+  band(dots(14), dots(23), dots(15)),                                                          // r1
+  band("..P" + dots(11), dots(6) + "L" + dots(4) + "1" + dots(2) + "G" + dots(8), dots(15), true),    // r2
+  band(dots(14), dots(23), dots(15)),                                                          // r3
+  wallRow([7, 27, 47]),                                                                     // r4
+  hall([8, "#"], [20, "#"], [32, "#"], [44, "#"]),                                    // r5
+  hall(),                                                                             // r6
+  wallRow([7, 27, 47]),                                                                     // r7
+  band(dots(14), dots(23), dots(15)),                                                          // r8
+  band("5..G" + dots(10), dots(11) + "2" + dots(11), dots(13) + "o" + dots(1)),                      // r9
+  band(dots(14), dots(23), dots(15)),                                                          // r10
+  wallRow([7, 27, 47]),                                                                     // r11
+  hall([8, "#"], [20, "#"], [32, "#"], [44, "#"], [45, "H"]),                         // r12
+  hall(),                                                                             // r13
+  wallRow([7, 27, 47]),                                                                     // r14
+  band(dots(14), dots(23), dots(15)),                                                          // r15
+  band("6" + dots(13), dots(6) + "L" + dots(16), dots(13) + "o" + dots(1), true),                    // r16
+  band(dots(14), dots(23), dots(15)),                                                          // r17
+  wallRow([7, 27, 47]),                                                                     // r18
+  hall(),                                                                             // r19
+  hall([20, "o"]),                                                                    // r20
+  wallRow([7, 27, 47]),                                                                     // r21
+  band2(dots(18), dots(19), dots(15)),                                                         // r22
+  band2(dots(18), dots(9) + "3" + dots(4) + "G" + dots(4), dots(15)),                                // r23
+  band2(dots(14) + "o" + dots(3), dots(19), dots(15)),                                            // r24
+  wallRow([9, 29, 47]),                                                                     // r25
+  band2(dots(18), dots(19), dots(12) + "8" + dots(2)),                                            // r26
+  band2(dots(6) + "H" + dots(11), dots(9) + "4" + dots(9), dots(4) + "7" + dots(3) + "G" + dots(6), true), // r27
+  band2(dots(18), dots(19), dots(10) + "X" + dots(4)),                                            // r28
+  wallRow([])                                                                               // r29 border
+];
+
+const grid = MAP.map(r => r.padEnd(COLS, "#").slice(0, COLS).split(""));
+const lights = [], hollowSpawns = [], oilPads = [], waypoints = {};
+let playerStart = null, goal = null;
+const guards = [];
+
+for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+  const c = grid[y][x];
+  const px = x * TILE + TILE / 2, py = y * TILE + TILE / 2;
+  if (c === "L") { lights.push({ x: px, y: py, r: 150 }); grid[y][x] = "."; }
+  else if (c === "H") { hollowSpawns.push({ x: px, y: py }); grid[y][x] = "."; }
+  else if (c === "o") { oilPads.push({ x: px, y: py, taken: false }); grid[y][x] = "."; }
+  else if (c === "P") { playerStart = { x: px, y: py }; grid[y][x] = "."; }
+  else if (c === "X") { goal = { x: px, y: py }; grid[y][x] = "."; }
+  else if (c === "G") { guards.push({ x: px, y: py, sx: px, sy: py }); grid[y][x] = "."; }
+  else if (c >= "1" && c <= "8") { (waypoints[c] = waypoints[c] || []).push({ x: px, y: py }); grid[y][x] = "."; }
+}
+
+/* patrol routes: guard index -> ordered waypoint keys */
+const PATROLS = [["1", "2"], ["5", "6"], ["3", "4"], ["7", "8"]];
+
+/* one-time sanity check: ragged rows / unreachable goal */
+if (MAP.some(r => r.length !== COLS))
+  console.error("DUSKWARD: ragged map row ->", MAP.map(r => r.length));
+(function connectivityCheck() {
+  const seen = new Set(), q = [[Math.floor(playerStart.x / TILE), Math.floor(playerStart.y / TILE)]];
+  while (q.length) {
+    const [x, y] = q.pop(), k = x + "," + y;
+    if (x < 0 || y < 0 || x >= COLS || y >= ROWS || seen.has(k) || grid[y][x] === "#") continue;
+    seen.add(k); q.push([x + 1, y], [x - 1, y], [x, y + 1], [x, y - 1]);
+  }
+  const gk = Math.floor(goal.x / TILE) + "," + Math.floor(goal.y / TILE);
+  console.log(seen.has(gk)
+    ? "DUSKWARD: map OK, " + seen.size + " reachable tiles, " + guards.length + " guards, " + hollowSpawns.length + " Hollow"
+    : "DUSKWARD ERROR: goal unreachable from start");
+})();
+
+/* ---------------- canvas ---------------- */
+const cv = document.getElementById("game"), ctx = cv.getContext("2d");
+const dark = document.createElement("canvas"), dctx = dark.getContext("2d");
+let W = 0, H = 0;
+function resize() {
+  W = cv.width = innerWidth; H = cv.height = innerHeight;
+  dark.width = W; dark.height = H;
+}
+addEventListener("resize", resize); resize();
+
+/* ---------------- input ---------------- */
+const keys = Object.create(null);
+addEventListener("keydown", e => {
+  if (["Tab", "Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code)) e.preventDefault();
+  keys[e.code] = true;
+  if (e.code === "KeyL") cycleLamp();
+  if (e.code === "KeyR") reset();
+  initAudio();
+});
+addEventListener("keyup", e => { keys[e.code] = false; });
+
+let audio = null;
+function initAudio() {
+  if (audio) return;
+  try { audio = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { audio = null; }
+}
+function beep(freq, dur = .12, type = "square", vol = .05) {
+  if (!audio) return;
+  const o = audio.createOscillator(), g = audio.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(vol, audio.currentTime);
+  g.gain.exponentialRampToValueAtTime(.0001, audio.currentTime + dur);
+  o.connect(g).connect(audio.destination); o.start(); o.stop(audio.currentTime + dur);
+}
+
+/* ---------------- world helpers ---------------- */
+function solidTile(tx, ty) {
+  if (tx < 0 || ty < 0 || tx >= COLS || ty >= ROWS) return true;
+  return grid[ty][tx] === "#";
+}
+function blocked(x, y, r) {
+  const x0 = Math.floor((x - r) / TILE), x1 = Math.floor((x + r) / TILE);
+  const y0 = Math.floor((y - r) / TILE), y1 = Math.floor((y + r) / TILE);
+  for (let ty = y0; ty <= y1; ty++) for (let tx = x0; tx <= x1; tx++)
+    if (solidTile(tx, ty)) return true;
+  return false;
+}
+function move(e, dx, dy) {
+  if (!blocked(e.x + dx, e.y, e.r)) e.x += dx;
+  if (!blocked(e.x, e.y + dy, e.r)) e.y += dy;
+}
+/* stepped raycast against the tile grid -> {dist, x, y} */
+function castRay(x, y, a, max) {
+  const dx = Math.cos(a), dy = Math.sin(a);
+  let t = 0; const step = 4;
+  while (t < max) {
+    t += step;
+    if (solidTile(Math.floor((x + dx * t) / TILE), Math.floor((y + dy * t) / TILE)))
+      return { dist: t - step, x: x + dx * (t - step), y: y + dy * (t - step) };
+  }
+  return { dist: max, x: x + dx * max, y: y + dy * max };
+}
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function angDiff(a, b) {
+  let d = (b - a) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+/* ---------------- entities ---------------- */
+const LAMP = [ { r: 0,   drain: 0    },
+               { r: 95,  drain: 1/40 },
+               { r: 205, drain: 1/12 } ];
+/* detection multiplier by lamp state: darkness makes you nearly unreadable */
+const LIGHT_MUL = [0.06, 1.0, 2.6];
+
+let player, hollows, alarm, focus, over, won, events = [], alarmT = 0;
+
+function reset() {
+  player = { x: playerStart.x, y: playerStart.y, r: 9, lamp: 1, oil: 1,
+             speed: 118, sprinting: false, sneaking: false, vx: 0, vy: 0 };
+  hollows = hollowSpawns.map(s => ({ x: s.x, y: s.y, r: 10, speed: 74, state: "idle", t: 0, wx: s.x, wy: s.y }));
+  guards.forEach((g, i) => {
+    g.x = g.sx; g.y = g.sy;
+    g.r = 10; g.speed = 62; g.turn = 2.6; g.fov = Math.PI * 0.55; g.range = 235;
+    g.awareness = 0; g.state = "patrol"; g.timer = 0; g.target = null;
+    g.angle = Math.random() * Math.PI * 2;
+    const route = PATROLS[i] || [];
+    g.patrol = route.flatMap(k => waypoints[k] || []);
+    g.pi = 0;
+    if (!g.patrol.length) g.patrol = [{ x: g.x, y: g.y }];
+  });
+  oilPads.forEach(p => { p.taken = false; });
+  alarm = 0; focus = false; over = false; won = false; events = []; alarmT = 0;
+  log("Run started. Lamp is DIM.");
+}
+function log(t) { events.push({ t, life: 6 }); if (events.length > 4) events.shift(); }
+
+function cycleLamp() {
+  if (over || won) return;
+  player.lamp = (player.lamp + 1) % 3;
+  log("Lamp → " + ["OFF", "DIM", "BRIGHT"][player.lamp]);
+}
+
+/* is the player currently illuminated by anything? */
+function playerLit() {
+  if (player.lamp > 0) return true;
+  return lights.some(l => dist(l, player) < l.r);
+}
+
+/* ---------------- update ---------------- */
+function update(dt) {
+  if (over || won) return;
+
+  /* --- player intent --- */
+  let mx = 0, my = 0;
+  if (keys.KeyA || keys.ArrowLeft)  mx -= 1;
+  if (keys.KeyD || keys.ArrowRight) mx += 1;
+  if (keys.KeyW || keys.ArrowUp)    my += -1;
+  if (keys.KeyS || keys.ArrowDown)  my += 1;
+  const len = Math.hypot(mx, my) || 1; mx /= len; my /= len;
+  player.sneaking  = !!(keys.ControlLeft || keys.KeyC);
+  player.sprinting = !!(keys.ShiftLeft || keys.ShiftRight) && !player.sneaking;
+  const spd = player.speed * (player.sprinting ? 1.75 : player.sneaking ? 0.5 : 1);
+  player.vx = mx * spd; player.vy = my * spd;
+  move(player, player.vx * dt, player.vy * dt);
+  const moving = Math.hypot(player.vx, player.vy) > 1;
+
+  /* --- lamp oil --- */
+  if (player.lamp > 0) {
+    player.oil -= LAMP[player.lamp].drain * dt;
+    if (player.oil <= 0) { player.oil = 0; player.lamp = 0; log("Oil spent. Lamp out."); beep(120, .3, "sawtooth"); }
+  }
+  oilPads.forEach(p => {
+    if (!p.taken && dist(p, player) < 16) {
+      p.taken = true; player.oil = Math.min(1, player.oil + .34);
+      log("Oil flask recovered."); beep(660, .08, "triangle");
+    }
+  });
+
+  /* --- guards --- */
+  const lit = playerLit();
+  let maxSeen = 0, reason = "";
+  guards.forEach(g => {
+    const d = dist(g, player);
+    let sees = false;
+
+    /* line of sight inside the cone, occluded by walls */
+    if (d < g.range &&
+        Math.abs(angDiff(g.angle, Math.atan2(player.y - g.y, player.x - g.x))) < g.fov / 2) {
+      const hit = castRay(g.x, g.y, Math.atan2(player.y - g.y, player.x - g.x), g.range + 20);
+      if (hit.dist >= d - 2) sees = true;
+    }
+
+    /* hearing: sprinting makes noise */
+    const noiseR = player.sprinting && moving ? 230 : 0;
+    const hears = noiseR > 0 && d < noiseR;
+
+    /* awareness rate = LIGHT x SPEED x DISTANCE  (the fairness formula) */
+    let rate = 0, why = "";
+    if (sees) {
+      const lightMul = LIGHT_MUL[player.lamp];
+      const speedMul = player.sprinting ? 2.5 : player.sneaking ? 0.4 : 1.0;
+      const distMul  = 1.0 + (1 - d / g.range);
+      rate = 46 * lightMul * speedMul * distMul;
+      why = lightMul >= 2 ? "LIT" : distMul > 1.5 ? "CLOSE" : speedMul > 1 ? "MOVING" : "SEEN";
+    }
+    if (hears) { rate = Math.max(rate, 34 * (1 - d / noiseR)); why = "NOISE"; }
+
+    g.awareness = Math.max(0, Math.min(100, g.awareness + (rate ? rate * dt : -26 * dt)));
+
+    if (g.awareness >= 100 && g.state !== "hunt") {
+      g.state = "hunt"; g.timer = 0; g.target = { x: player.x, y: player.y };
+      raiseAlarm(3, g); log("SPOTTED — " + why); beep(220, .25, "square", .07);
+    } else if (g.awareness > 32 && g.state === "patrol") {
+      g.state = "suspicious"; g.timer = 6; g.target = { x: player.x, y: player.y };
+      log("Guard heard / half-saw something."); beep(440, .1, "triangle");
+    }
+    if (rate > 0 && rate * dt > 1) reason = why;
+    maxSeen = Math.max(maxSeen, g.awareness);
+
+    /* --- behaviour --- */
+    g.timer -= dt;
+    let dest = null;
+    const sp = g.state === "hunt" ? g.speed * 1.5
+             : g.state === "search" ? g.speed * 0.95
+             : g.state === "suspicious" ? g.speed * 0.85 : g.speed * 0.7;
+
+    if (g.state === "patrol") {
+      const wp = g.patrol[g.pi % g.patrol.length];
+      dest = wp;
+      if (dist(g, wp) < 14) g.pi++;
+      const want = Math.atan2(dest.y - g.y, dest.x - g.x);
+      g.angle += Math.max(-g.turn * dt, Math.min(g.turn * dt, angDiff(g.angle, want)));
+    } else if (g.state === "suspicious") {
+      dest = g.target || g;
+      if (dest && dist(g, dest) < 18) g.angle += 1.6 * dt;
+      else {
+        const want = Math.atan2(dest.y - g.y, dest.x - g.x);
+        g.angle += Math.max(-g.turn * dt, Math.min(g.turn * dt, angDiff(g.angle, want)));
+      }
+      if (g.timer <= 0) { g.state = "patrol"; g.awareness = 0; g.target = null; }
+    } else if (g.state === "hunt") {
+      g.target = { x: player.x, y: player.y };
+      dest = g.target;
+      g.angle += Math.max(-g.turn * 1.6 * dt, Math.min(g.turn * 1.6 * dt,
+                  angDiff(g.angle, Math.atan2(player.y - g.y, player.x - g.x))));
+      if (d < 20) { die("A guard ran you down."); }
+      if (!sees && !hears) { g.timer += dt; if (g.timer > 3.5) { g.state = "search"; g.timer = 8; } }
+      else g.timer = 0;
+    } else if (g.state === "search") {
+      dest = g.target || g;
+      g.angle += 1.9 * dt;
+      if (g.timer <= 0) { g.state = "patrol"; g.awareness = 0; log("Guard gives up."); }
+    }
+
+    if (dest && dest !== g) {
+      const a = Math.atan2(dest.y - g.y, dest.x - g.x);
+      const bx = g.x, by = g.y;
+      move(g, Math.cos(a) * sp * dt, Math.sin(a) * sp * dt);
+      if (Math.hypot(g.x - bx, g.y - by) < sp * dt * .3)   /* stuck: sidestep */
+        move(g, -Math.sin(a) * sp * dt, Math.cos(a) * sp * dt);
+    }
+  });
+
+  /* --- alarm decay --- */
+  if (alarm > 0) {
+    alarmT -= dt;
+    if (alarmT <= 0) {
+      alarm = Math.max(0, alarm - 1); alarmT = 9;
+      if (alarm === 0) log("All clear.");
+    }
+  }
+
+  /* --- the Hollow: hunts sound, cannot abide light --- */
+  hollows.forEach(h => {
+    h.t -= dt;
+    const d = dist(h, player);
+    const nearLight = player.lamp > 0 ? LAMP[player.lamp].r + 60
+                    : (lights.find(l => dist(l, player) < l.r + 60) ? 210 : 0);
+    if (nearLight > 0 && d < nearLight + 90) h.state = "flee";
+    else if (!lit && d < 340 && (moving || d < 200)) h.state = "chase";
+    else if (h.state === "chase" && (lit || d > 380)) h.state = "idle";
+
+    let sp = h.speed, dest = null;
+    if (h.state === "chase") {
+      dest = player; sp = h.speed * 1.25;
+      if (h.t <= 0) { h.t = 3.2; beep(90, .5, "sawtooth", .05); raiseAlarm(2, h); log("A Hollow shrieked in the dark."); }
+      if (d < 18) die("The dark took you.");
+    } else if (h.state === "flee") {
+      const a = Math.atan2(h.y - player.y, h.x - player.x);
+      dest = { x: h.x + Math.cos(a) * 200, y: h.y + Math.sin(a) * 200 };
+    } else {
+      if (h.t <= 0 || dist(h, { x: h.wx, y: h.wy }) < 20) {
+        h.t = 2 + Math.random() * 3;
+        for (let i = 0; i < 30; i++) {
+          const tx = Math.floor(Math.random() * COLS), ty = Math.floor(Math.random() * ROWS);
+          if (!solidTile(tx, ty)) { h.wx = tx * TILE + 16; h.wy = ty * TILE + 16; break; }
+        }
+      }
+      dest = { x: h.wx, y: h.wy }; sp = h.speed * 0.45;
+    }
+    if (dest) { const a = Math.atan2(dest.y - h.y, dest.x - h.x); move(h, Math.cos(a) * sp * dt, Math.sin(a) * sp * dt); }
+  });
+
+  /* --- win --- */
+  if (dist(player, goal) < 18) { won = true; log("Furnace district reached. Prototype complete."); beep(880, .3, "triangle"); }
+
+  /* --- HUD --- */
+  document.getElementById("lamp").textContent = ["OFF", "DIM", "BRIGHT"][player.lamp];
+  document.getElementById("oil").textContent = Math.round(player.oil * 100) + "%";
+  document.getElementById("oilbar").style.width = (player.oil * 100) + "%";
+  document.getElementById("seen").textContent = Math.round(maxSeen) + (reason ? " · " + reason : "");
+  document.getElementById("seenbar").style.width = maxSeen + "%";
+  const t = document.getElementById("tier");
+  t.textContent = ["CALM", "CURIOUS", "ALERTED", "HUNT"][alarm];
+  t.className = "v tier" + alarm;
+  document.getElementById("msg").textContent = won ? "PROTOTYPE COMPLETE — press R"
+                                                   : over ? "CAUGHT — press R" : "";
+  events.forEach(e => e.life -= dt);
+  events = events.filter(e => e.life > 0);
+  document.getElementById("events").innerHTML =
+    events.map(e => `<div style="opacity:${Math.min(1, e.life / 2)}">› ${e.t}</div>`).join("");
+}
+
+function raiseAlarm(tier, src) {
+  if (tier <= alarm) return;
+  alarm = tier; alarmT = 9;
+  guards.forEach(g => {
+    if (g !== src && g.state === "patrol" && dist(g, src) < 520) {
+      g.state = "suspicious"; g.timer = 7;
+      g.awareness = Math.max(g.awareness, 40);
+      g.target = { x: src.x, y: src.y };
+    }
+  });
+  beep(tier === 3 ? 300 : 380, .18, "square", .06);
+}
+function die(why) { if (over) return; over = true; log(why); beep(80, .6, "sawtooth", .08); }
+
+/* ---------------- render ---------------- */
+let tick = 0;
+function draw() {
+  tick++;
+  ctx.fillStyle = "#05070c"; ctx.fillRect(0, 0, W, H);
+  const camX = Math.max(0, Math.min(COLS * TILE - W, player.x - W / 2));
+  const camY = Math.max(0, Math.min(ROWS * TILE - H, player.y - H / 2));
+  ctx.save(); ctx.translate(-camX, -camY);
+
+  const x0 = Math.max(0, Math.floor(camX / TILE)), x1 = Math.min(COLS - 1, Math.ceil((camX + W) / TILE));
+  const y0 = Math.max(0, Math.floor(camY / TILE)), y1 = Math.min(ROWS - 1, Math.ceil((camY + H) / TILE));
+
+  /* floor + walls */
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const px = x * TILE, py = y * TILE, solid = grid[y][x] === "#";
+    ctx.fillStyle = solid ? "#232a38" : ((x + y) % 2 ? "#12161f" : "#141922");
+    ctx.fillRect(px, py, TILE, TILE);
+    if (solid) { ctx.fillStyle = "#333c4f"; ctx.fillRect(px, py, TILE, 3); }
+  }
+
+  /* oil + goal */
+  oilPads.forEach(p => {
+    if (p.taken) return;
+    ctx.fillStyle = "#ffd27a";
+    ctx.beginPath(); ctx.arc(p.x, p.y, 5 + Math.sin(tick / 12) * 1.2, 0, 7); ctx.fill();
+  });
+  ctx.strokeStyle = "#7CFFB2"; ctx.lineWidth = 2;
+  ctx.strokeRect(goal.x - 13, goal.y - 13, 26, 26);
+  ctx.fillStyle = "#7CFFB2"; ctx.font = "10px monospace"; ctx.textAlign = "center";
+  ctx.fillText("FURNACE", goal.x, goal.y - 20);
+
+  /* vision cones: faint always, fully revealed in focus mode */
+  guards.forEach(g => {
+    const col = g.state === "hunt" ? "255,70,70" : g.state === "patrol" ? "120,200,255" : "255,200,90";
+    const a = focus ? (g.state === "hunt" ? .34 : .2) : .09;
+    ctx.beginPath(); ctx.moveTo(g.x, g.y);
+    const N = 26;
+    for (let i = 0; i <= N; i++) {
+      const ang = g.angle - g.fov / 2 + (g.fov * i) / N;
+      const h = castRay(g.x, g.y, ang, g.range);
+      ctx.lineTo(h.x, h.y);
+    }
+    ctx.closePath();
+    ctx.fillStyle = `rgba(${col},${a})`; ctx.fill();
+    ctx.strokeStyle = `rgba(${col},${a + .12})`; ctx.lineWidth = 1; ctx.stroke();
+    if (focus) {
+      ctx.beginPath(); ctx.arc(g.x, g.y, 60, 0, 7);
+      ctx.strokeStyle = "rgba(160,180,220,.18)"; ctx.stroke();
+    }
+  });
+
+  /* entities */
+  hollows.forEach(h => {
+    const seen = playerLit() || dist(h, player) < 240;
+    ctx.globalAlpha = seen ? .95 : .45;
+    ctx.fillStyle = "#1a1030";
+    ctx.beginPath(); ctx.arc(h.x, h.y, 11, 0, 7); ctx.fill();
+    ctx.fillStyle = "#ff4d6d";
+    ctx.beginPath(); ctx.arc(h.x - 4, h.y - 2, 2.2, 0, 7); ctx.arc(h.x + 4, h.y - 2, 2.2, 0, 7); ctx.fill();
+    ctx.globalAlpha = 1;
+  });
+  guards.forEach(g => {
+    ctx.fillStyle = g.state === "hunt" ? "#ff6b6b" : g.state === "suspicious" ? "#ffcf6a" : "#6fa8dc";
+    ctx.beginPath(); ctx.arc(g.x, g.y, 10, 0, 7); ctx.fill();
+    ctx.strokeStyle = "#0b0e14"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(g.x, g.y);
+    ctx.lineTo(g.x + Math.cos(g.angle) * 16, g.y + Math.sin(g.angle) * 16); ctx.stroke();
+    if (g.awareness > 2) {
+      ctx.fillStyle = "#0b0e14"; ctx.fillRect(g.x - 16, g.y - 22, 32, 5);
+      ctx.fillStyle = g.awareness > 70 ? "#ff6b6b" : "#ffcf6a";
+      ctx.fillRect(g.x - 15, g.y - 21, 30 * (g.awareness / 100), 3);
+    }
+  });
+  ctx.fillStyle = "#e8edf6";
+  ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, 7); ctx.fill();
+  ctx.strokeStyle = "#0b0e14"; ctx.lineWidth = 2; ctx.stroke();
+  if (player.sprinting) {
+    ctx.strokeStyle = `rgba(255,120,120,${.35 * Math.abs(Math.sin(tick / 8))})`;
+    ctx.beginPath(); ctx.arc(player.x, player.y, 22, 0, 7); ctx.stroke();
+  }
+
+  ctx.restore();
+
+  /* ---- darkness overlay with a hole punched for every light ---- */
+  dctx.globalCompositeOperation = "source-over";
+  dctx.clearRect(0, 0, W, H);
+  dctx.fillStyle = "rgba(3,5,10,0.90)"; dctx.fillRect(0, 0, W, H);
+  dctx.globalCompositeOperation = "destination-out";
+  const punch = (x, y, r, soft) => {
+    const g = dctx.createRadialGradient(x, y, r * (soft || .05), x, y, r);
+    g.addColorStop(0, "rgba(255,255,255,1)"); g.addColorStop(1, "rgba(255,255,255,0)");
+    dctx.fillStyle = g; dctx.beginPath(); dctx.arc(x, y, r, 0, 7); dctx.fill();
+  };
+  lights.forEach(l => punch(l.x - camX, l.y - camY, l.r, .25));
+  if (player.lamp > 0) punch(player.x - camX, player.y - camY, LAMP[player.lamp].r, .08);
+  ctx.drawImage(dark, 0, 0);
+
+  /* warm additive tint so lit areas read as safe / exposed */
+  ctx.save(); ctx.globalCompositeOperation = "lighter"; ctx.translate(-camX, -camY);
+  lights.forEach(l => {
+    const g = ctx.createRadialGradient(l.x, l.y, 0, l.x, l.y, l.r);
+    g.addColorStop(0, "rgba(255,170,80,.20)"); g.addColorStop(1, "rgba(255,170,80,0)");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(l.x, l.y, l.r, 0, 7); ctx.fill();
+  });
+  if (player.lamp > 0) {
+    const r = LAMP[player.lamp].r;
+    const g = ctx.createRadialGradient(player.x, player.y, 0, player.x, player.y, r);
+    g.addColorStop(0, player.lamp === 2 ? "rgba(255,225,170,.30)" : "rgba(255,225,170,.16)");
+    g.addColorStop(1, "rgba(255,225,170,0)");
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(player.x, player.y, r, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+
+  /* overlays */
+  if (focus) { ctx.fillStyle = "rgba(120,200,255,.05)"; ctx.fillRect(0, 0, W, H); }
+  if (over || won) {
+    ctx.fillStyle = "rgba(5,7,12,.72)"; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = over ? "#ff6b6b" : "#7CFFB2"; ctx.textAlign = "center";
+    ctx.font = "700 34px ui-monospace, monospace";
+    ctx.fillText(over ? "CAUGHT" : "PROTOTYPE COMPLETE", W / 2, H / 2 - 6);
+    ctx.font = "13px ui-monospace, monospace"; ctx.fillStyle = "#cfd6e4";
+    ctx.fillText(over ? "Light and sound, both at once. That is the whole game."
+                      : "You managed light, sound and the dark. Now imagine 12 zones of it.", W / 2, H / 2 + 24);
+    ctx.fillText("press R to restart", W / 2, H / 2 + 46);
+  }
+}
+
+/* ---------------- loop ---------------- */
+let last = performance.now();
+function frame(now) {
+  const raw = Math.min(.05, (now - last) / 1000); last = now;
+  focus = !!keys.Tab;
+  update(raw * (focus ? 0.35 : 1));
+  draw();
+  requestAnimationFrame(frame);
+}
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
